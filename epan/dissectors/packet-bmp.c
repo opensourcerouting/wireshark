@@ -34,6 +34,8 @@ void proto_reg_handoff_bmp(void);
 #define BMP_MSG_TYPE_PEER_UP            0x03    /* Peer Up Notification */
 #define BMP_MSG_TYPE_INIT               0x04    /* Initiation Message */
 #define BMP_MSG_TYPE_TERM               0x05    /* Termination Message */
+#define BMP_MSG_TYPE_ROUTE_MIRRORING    0x06    /* Route Mirroring */
+#define BMP_MSG_TYPE__SIZE              0x07
 
 /* BMP Initiation Message Types */
 #define BMP_INIT_INFO_STRING            0x00    /* String */
@@ -47,7 +49,8 @@ void proto_reg_handoff_bmp(void);
 /* BMP Per Peer Header Flags */
 #define BMP_PEER_FLAG_IPV6              0x80    /* V Flag: IPv6 */
 #define BMP_PEER_FLAG_POST_POLICY       0x40    /* L Flag: Post-policy */
-#define BMP_PEER_FLAG_RES               0x3F    /* Reserved */
+#define BMP_PEER_FLAG_AS2               0x20    /* A Flag: legacy AS2 */
+#define BMP_PEER_FLAG_RES               0x1F    /* Reserved */
 #define BMP_PEER_FLAG_MASK              0xFF
 
 /* BMP Stat Types */
@@ -77,6 +80,10 @@ void proto_reg_handoff_bmp(void);
 #define BMP_TERM_REASON_RESOURCES       0x02    /* Out of resources */
 #define BMP_TERM_REASON_REDUNDANT       0x03    /* Redundant connection */
 
+/* BMP Mirroring Information Codes */
+#define BMP_MIRROR_CODE_ERRORPDU        0x00    /* Errored PDU */
+#define BMP_MIRROR_CODE_MSGLOST         0x01    /* Lost Route Mirroring messages */
+
 static const value_string bmp_typevals[] = {
     { BMP_MSG_TYPE_ROUTE_MONITORING,    "Route Monitoring" },
     { BMP_MSG_TYPE_STAT_REPORT,         "Statistics Report" },
@@ -84,6 +91,7 @@ static const value_string bmp_typevals[] = {
     { BMP_MSG_TYPE_PEER_UP,             "Peer Up Notification" },
     { BMP_MSG_TYPE_INIT,                "Initiation Message" },
     { BMP_MSG_TYPE_TERM,                "Termination Message" },
+    { BMP_MSG_TYPE_ROUTE_MIRRORING,     "Route Mirroring" },
     { 0, NULL }
 };
 
@@ -135,6 +143,18 @@ static const value_string stat_typevals[] = {
     { 0, NULL }
 };
 
+static const value_string mirror_typevals[] = {
+    { 0,                                "BGP Message" },
+    { 1,                                "Information" },
+    { 0, NULL }
+};
+
+static const value_string mirror_codevals[] = {
+    { BMP_MIRROR_CODE_ERRORPDU,         "Errored PDU" },
+    { BMP_MIRROR_CODE_MSGLOST,          "Mirroring messages lost" },
+    { 0, NULL }
+};
+
 static int proto_bmp = -1;
 
 /* BMP Common Header filed */
@@ -157,6 +177,7 @@ static int hf_peer_type = -1;
 static int hf_peer_flags = -1;
 static int hf_peer_flags_ipv6 = -1;
 static int hf_peer_flags_post_policy = -1;
+static int hf_peer_flags_as2 = -1;
 static int hf_peer_flags_res = -1;
 static int hf_peer_distinguisher = -1;
 static int hf_peer_ipv4_address = -1;
@@ -171,6 +192,9 @@ static int hf_peer_up_ipv4_address = -1;
 static int hf_peer_up_ipv6_address = -1;
 static int hf_peer_up_local_port = -1;
 static int hf_peer_up_remote_port = -1;
+static int hf_peer_up_sent_open = -1;
+static int hf_peer_up_rcvd_open = -1;
+static int hf_peer_up_info = -1;
 
 /* BMP Peer Down Notification filed */
 static int hf_peer_down_reason = -1;
@@ -190,12 +214,19 @@ static int hf_term_len = -1;
 static int hf_term_info = -1;
 static int hf_term_reason = -1;
 
+static int hf_mirror_type = -1;
+static int hf_mirror_length = -1;
+static int hf_mirror_code = -1;
+
 static gint ett_bmp = -1;
 static gint ett_bmp_route_monitoring = -1;
 static gint ett_bmp_stat_report = -1;
 static gint ett_bmp_stat_type = -1;
 static gint ett_bmp_peer_down = -1;
 static gint ett_bmp_peer_up = -1;
+static gint ett_bmp_peer_up_sent_open = -1;
+static gint ett_bmp_peer_up_rcvd_open = -1;
+static gint ett_bmp_peer_up_info = -1;
 static gint ett_bmp_peer_header = -1;
 static gint ett_bmp_peer_flags = -1;
 static gint ett_bmp_init = -1;
@@ -204,12 +235,42 @@ static gint ett_bmp_init_type = -1;
 static gint ett_bmp_term = -1;
 static gint ett_bmp_term_type = -1;
 static gint ett_bmp_term_types = -1;
+static gint ett_bmp_route_mirroring = -1;
+static gint ett_bmp_route_mirror_type = -1;
+static gint ett_bmp_route_mirror_code = -1;
 
 static dissector_handle_t dissector_bgp;
 
 /* desegmentation */
 static gboolean bmp_desegment = TRUE;
 
+
+static void
+dissect_bmp_info_tlvs(tvbuff_t *tvb, proto_tree *parent_tree, proto_tree *pti, packet_info *pinfo _U_, int offset)
+{
+    guint16 init_type;
+    guint16 init_len;
+
+    while (tvb_reported_length_remaining(tvb, offset) > 0) {
+        proto_tree *ti;
+        proto_tree *subtree;
+
+        init_type = tvb_get_ntohs(tvb, offset);
+        proto_item_append_text(pti, ", Type %s",
+                val_to_str(init_type, init_typevals, "Unknown (0x%02x)"));
+
+        ti = proto_tree_add_item(parent_tree, hf_init_type, tvb, offset, 2, ENC_BIG_ENDIAN);
+        subtree = proto_item_add_subtree(ti, ett_bmp_init_type);
+        offset += 2;
+
+        init_len = tvb_get_ntohs(tvb, offset);
+        proto_tree_add_item(subtree, hf_init_length, tvb, offset, 2, ENC_BIG_ENDIAN);
+        offset += 2;
+
+        proto_tree_add_item(subtree, hf_init_info, tvb, offset, init_len, ENC_ASCII|ENC_NA);
+        offset += init_len;
+    }
+}
 
 /*
  * Dissect BMP Peer Down Notification
@@ -262,6 +323,10 @@ dissect_bmp_peer_down_notification(tvbuff_t *tvb, proto_tree *tree, packet_info 
 static void
 dissect_bmp_peer_up_notification(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int offset, gint8 flags)
 {
+    guint16 open_len;
+    proto_item *ti;
+    proto_item *subtree;
+
     if (flags & BMP_PEER_FLAG_IPV6) {
         proto_tree_add_item(tree, hf_peer_up_ipv6_address, tvb, offset, 16, ENC_NA);
         offset += 16;
@@ -278,7 +343,30 @@ dissect_bmp_peer_up_notification(tvbuff_t *tvb, proto_tree *tree, packet_info *p
     proto_tree_add_item(tree, hf_peer_up_remote_port, tvb, offset, 2, ENC_BIG_ENDIAN);
     offset += 2;
 
-    call_dissector(dissector_bgp, tvb_new_subset_remaining(tvb, offset), pinfo, tree);
+    open_len = tvb_get_ntohs(tvb, offset + 16);
+    if (!open_len)
+        return;
+
+    ti = proto_tree_add_item(tree, hf_peer_up_sent_open, tvb, offset, open_len, ENC_NA);
+    subtree = proto_item_add_subtree(ti, ett_bmp_peer_up_sent_open);
+
+    call_dissector(dissector_bgp, tvb_new_subset_length(tvb, offset, open_len), pinfo, subtree);
+    offset += open_len;
+
+    open_len = tvb_get_ntohs(tvb, offset + 16);
+    if (!open_len)
+        return;
+
+    ti = proto_tree_add_item(tree, hf_peer_up_rcvd_open, tvb, offset, open_len, ENC_NA);
+    subtree = proto_item_add_subtree(ti, ett_bmp_peer_up_rcvd_open);
+
+    call_dissector(dissector_bgp, tvb_new_subset_length(tvb, offset, open_len), pinfo, subtree);
+    offset += open_len;
+
+    ti = proto_tree_add_item(tree, hf_peer_up_info, tvb, offset, tvb_reported_length_remaining(tvb, offset), ENC_NA);
+    subtree = proto_item_add_subtree(ti, ett_bmp_peer_up_info);
+
+    dissect_bmp_info_tlvs(tvb, subtree, ti, pinfo, offset);
 }
 
 /*
@@ -376,6 +464,50 @@ dissect_bmp_termination(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo _U_,
 
 
 /*
+ *
+ */
+static void
+dissect_bmp_mirror(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int offset, gint8 flags _U_)
+{
+    guint16 tlv_type;
+    guint16 tlv_len;
+/*
+    proto_tree *pti;
+    proto_tree *parent_tree;
+
+    pti = proto_tree_add_item(tree, hf_init_types, tvb, offset, len, ENC_NA);
+    parent_tree = proto_item_add_subtree(pti, ett_bmp_init_types);
+*/
+    while (tvb_reported_length_remaining(tvb, offset) > 0) {
+        proto_tree *ti;
+        proto_tree *subtree;
+
+        tlv_type = tvb_get_ntohs(tvb, offset);
+
+        ti = proto_tree_add_item(tree, hf_mirror_type, tvb, offset, 2, ENC_BIG_ENDIAN);
+        subtree = proto_item_add_subtree(ti, ett_bmp_route_mirror_type);
+        offset += 2;
+
+        tlv_len = tvb_get_ntohs(tvb, offset);
+        proto_tree_add_item(subtree, hf_mirror_length, tvb, offset, 2, ENC_BIG_ENDIAN);
+        offset += 2;
+
+        switch (tlv_type) {
+            case 0:
+                call_dissector(dissector_bgp, tvb_new_subset_remaining(tvb, offset), pinfo, ti);
+                break;
+            case 1:
+                proto_tree_add_item(subtree, hf_mirror_code, tvb, offset, 2, ENC_BIG_ENDIAN);
+                break;
+            default:
+                break;
+        }
+        offset += tlv_len;
+    }
+
+}
+
+/*
  * Dissect BMP Per-Peer Header
  *
  *   0 1 2 3 4 5 6 7 8 1 2 3 4 5 6 7 8 1 2 3 4 5 6 7 8 1 2 3 4 5 6 7 8
@@ -399,7 +531,7 @@ dissect_bmp_termination(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo _U_,
  *
  */
 static void
-dissect_bmp_peer_header(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int offset, guint8 bmp_type, guint16 len)
+dissect_bmp_peer_header(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int offset, guint8 bmp_type, guint16 len _U_)
 {
     guint8  flags;
     proto_item *item;
@@ -409,11 +541,12 @@ dissect_bmp_peer_header(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int
     static const int * peer_flags[] = {
         &hf_peer_flags_ipv6,
         &hf_peer_flags_post_policy,
+        &hf_peer_flags_as2,
         &hf_peer_flags_res,
         NULL
     };
 
-    ti = proto_tree_add_item(tree, hf_peer_header, tvb, offset, len, ENC_NA);
+    ti = proto_tree_add_item(tree, hf_peer_header, tvb, offset, 42, ENC_NA);
     subtree = proto_item_add_subtree(ti, ett_bmp_peer_header);
 
     proto_tree_add_item(subtree, hf_peer_type, tvb, offset, 1, ENC_BIG_ENDIAN);
@@ -463,6 +596,9 @@ dissect_bmp_peer_header(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int
         case BMP_MSG_TYPE_PEER_UP:
             dissect_bmp_peer_up_notification(tvb, tree, pinfo, offset, flags);
             break;
+        case BMP_MSG_TYPE_ROUTE_MIRRORING:
+            dissect_bmp_mirror(tvb, tree, pinfo, offset, flags);
+            break;
         case BMP_MSG_TYPE_INIT:
         case BMP_MSG_TYPE_TERM:
         default:
@@ -486,35 +622,15 @@ dissect_bmp_peer_header(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int
  *
  */
 static void
-dissect_bmp_init(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo _U_, int offset, guint8 bmp_type _U_, guint16 len)
+dissect_bmp_init(tvbuff_t *tvb, proto_tree *tree, packet_info *pinfo, int offset, guint8 bmp_type _U_, guint16 len)
 {
-    guint16 init_type;
-    guint16 init_len;
     proto_tree *pti;
     proto_tree *parent_tree;
 
-    pti = proto_tree_add_item(tree, hf_init_types, tvb, offset, len, ENC_NA);
+    pti = proto_tree_add_item(tree, hf_init_types, tvb, offset, len - offset, ENC_NA);
     parent_tree = proto_item_add_subtree(pti, ett_bmp_init_types);
 
-    while (tvb_reported_length_remaining(tvb, offset) > 0) {
-        proto_tree *ti;
-        proto_tree *subtree;
-
-        init_type = tvb_get_ntohs(tvb, offset);
-        proto_item_append_text(pti, ", Type %s",
-                val_to_str(init_type, init_typevals, "Unknown (0x%02x)"));
-
-        ti = proto_tree_add_item(parent_tree, hf_init_type, tvb, offset, 2, ENC_BIG_ENDIAN);
-        subtree = proto_item_add_subtree(ti, ett_bmp_init_type);
-        offset += 2;
-
-        init_len = tvb_get_ntohs(tvb, offset);
-        proto_tree_add_item(subtree, hf_init_length, tvb, offset, 2, ENC_BIG_ENDIAN);
-        offset += 2;
-
-        proto_tree_add_item(subtree, hf_init_info, tvb, offset, init_len, ENC_ASCII|ENC_NA);
-        offset += init_len;
-    }
+    dissect_bmp_info_tlvs(tvb, parent_tree, pti, pinfo, offset);
 }
 
 /*
@@ -545,18 +661,18 @@ dissect_bmp_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data 
     gint        arg;
     proto_item  *ti;
     proto_item  *bmp_tree;
-
-    col_set_str(pinfo->cinfo, COL_PROTOCOL, "BMP");
-    col_clear(pinfo->cinfo, COL_INFO);
+    size_t      *items = (size_t *)data;
 
     bmp_type = tvb_get_guint8(tvb, 5);
-
-    col_add_fstr(pinfo->cinfo, COL_INFO, "Type: %s",
-            val_to_str(bmp_type, bmp_typevals, "Unknown (0x%02x)"));
 
     ti = proto_tree_add_item(tree, proto_bmp, tvb, 0, -1, ENC_NA);
     proto_item_append_text(ti, ", Type %s",
             val_to_str(bmp_type, bmp_typevals, "Unknown (0x%02x)"));
+
+    if (bmp_type < BMP_MSG_TYPE__SIZE)
+        items[bmp_type]++;
+    else
+        items[BMP_MSG_TYPE__SIZE]++;
 
     switch (bmp_type) {
         case BMP_MSG_TYPE_ROUTE_MONITORING:
@@ -576,6 +692,9 @@ dissect_bmp_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data 
             break;
         case BMP_MSG_TYPE_TERM:
             arg = ett_bmp_term;
+            break;
+        case BMP_MSG_TYPE_ROUTE_MIRRORING:
+            arg = ett_bmp_route_mirroring;
             break;
         default:
             arg = ett_bmp;
@@ -601,6 +720,7 @@ dissect_bmp_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data 
         case BMP_MSG_TYPE_STAT_REPORT:
         case BMP_MSG_TYPE_PEER_DOWN:
         case BMP_MSG_TYPE_PEER_UP:
+        case BMP_MSG_TYPE_ROUTE_MIRRORING:
             dissect_bmp_peer_header(tvb, bmp_tree, pinfo, offset, bmp_type, len);
             break;
         case BMP_MSG_TYPE_TERM:
@@ -616,9 +736,41 @@ dissect_bmp_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data 
 
 /* Main dissecting routine */
 static int
-dissect_bmp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+dissect_bmp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
-    tcp_dissect_pdus(tvb, pinfo, tree, bmp_desegment, FRAME_HEADER_LEN, get_bmp_pdu_len, dissect_bmp_pdu, data);
+    size_t items[BMP_MSG_TYPE__SIZE + 1] = {};
+    static const unsigned print_order[] = {
+        BMP_MSG_TYPE_INIT,
+        BMP_MSG_TYPE_TERM,
+        BMP_MSG_TYPE_PEER_UP,
+        BMP_MSG_TYPE_PEER_DOWN,
+        BMP_MSG_TYPE_ROUTE_MONITORING,
+        BMP_MSG_TYPE_ROUTE_MIRRORING,
+        BMP_MSG_TYPE_STAT_REPORT,
+        BMP_MSG_TYPE__SIZE,
+    };
+    gchar buf[512] = "", *b = buf;
+
+    tcp_dissect_pdus(tvb, pinfo, tree, bmp_desegment, FRAME_HEADER_LEN, get_bmp_pdu_len, dissect_bmp_pdu, items);
+
+    for (size_t i = 0; i < sizeof(print_order) / sizeof(print_order[0]); i++) {
+        unsigned bmp_type = print_order[i];
+
+        if (items[bmp_type] == 0)
+            continue;
+
+        g_snprintf(b, sizeof(buf) - (b - buf), "%s%s",
+                (b == buf) ? "" : ", ",
+                val_to_str(bmp_type, bmp_typevals, "Unknown"));
+        b += strlen(b);
+        if (items[bmp_type] > 1) {
+            g_snprintf(b, sizeof(buf) - (b - buf), "(%zu)", items[bmp_type]);
+            b += strlen(b);
+        }
+    }
+    col_set_str(pinfo->cinfo, COL_PROTOCOL, "BMP");
+    col_set_str(pinfo->cinfo, COL_INFO, buf);
+
     return tvb_captured_length(tvb);
 }
 
@@ -673,6 +825,9 @@ proto_register_bmp(void)
         { &hf_peer_flags_post_policy,
             { "Post-policy", "bmp.peer.flags.post_policy", FT_BOOLEAN, 8,
                 TFS(&tfs_set_notset), BMP_PEER_FLAG_POST_POLICY, NULL, HFILL }},
+        { &hf_peer_flags_as2,
+            { "Legacy 2-byte ASN", "bmp.peer.flags.as2", FT_BOOLEAN, 8,
+                TFS(&tfs_set_notset), BMP_PEER_FLAG_AS2, NULL, HFILL }},
         { &hf_peer_flags_res,
             { "Reserved", "bmp.peer.flags.reserved", FT_BOOLEAN, 8,
                 TFS(&tfs_set_notset), BMP_PEER_FLAG_RES, NULL, HFILL }},
@@ -708,6 +863,15 @@ proto_register_bmp(void)
                 NULL, 0x0, NULL, HFILL }},
         { &hf_peer_up_remote_port,
             { "Remote Port", "bmp.peer.up.port.remote", FT_UINT16, BASE_DEC,
+                NULL, 0x0, NULL, HFILL }},
+        { &hf_peer_up_sent_open,
+            { "BGP OPEN sent by monitored station", "bmp.peer.up.sent_open", FT_NONE, BASE_NONE,
+                NULL, 0x0, NULL, HFILL }},
+        { &hf_peer_up_rcvd_open,
+            { "BGP OPEN rcvd by monitored station", "bmp.peer.up.rcvd_open", FT_NONE, BASE_NONE,
+                NULL, 0x0, NULL, HFILL }},
+        { &hf_peer_up_info,
+            { "Information", "bmp.peer.up.info", FT_NONE, BASE_NONE,
                 NULL, 0x0, NULL, HFILL }},
 
         /* Peer Down Notification */
@@ -750,8 +914,18 @@ proto_register_bmp(void)
                 NULL, 0x0, NULL, HFILL }},
         { &hf_term_reason,
             { "Reason", "bmp.term.reason", FT_UINT16, BASE_DEC,
-                VALS(term_reason_typevals), 0x0, NULL, HFILL }}
+                VALS(term_reason_typevals), 0x0, NULL, HFILL }},
 
+        /* Mirror Message */
+        { &hf_mirror_type,
+            { "Type", "bmp.mirror.type", FT_UINT16, BASE_DEC,
+                VALS(mirror_typevals), 0x0, "Mirror TLV type", HFILL }},
+        { &hf_mirror_length,
+            { "Length", "bmp.mirror.length", FT_UINT16, BASE_DEC,
+                NULL, 0x0, NULL, HFILL }},
+        { &hf_mirror_code,
+            { "Code", "bmp.mirror.code", FT_UINT16, BASE_DEC,
+                VALS(mirror_codevals), 0x0, "Mirror information code", HFILL }},
     };
 
     /* Setup protocol subtree array */
@@ -762,6 +936,9 @@ proto_register_bmp(void)
         &ett_bmp_stat_type,
         &ett_bmp_peer_down,
         &ett_bmp_peer_up,
+        &ett_bmp_peer_up_sent_open,
+        &ett_bmp_peer_up_rcvd_open,
+        &ett_bmp_peer_up_info,
         &ett_bmp_peer_header,
         &ett_bmp_peer_flags,
         &ett_bmp_init,
@@ -770,6 +947,9 @@ proto_register_bmp(void)
         &ett_bmp_term,
         &ett_bmp_term_type,
         &ett_bmp_term_types,
+        &ett_bmp_route_mirroring,
+        &ett_bmp_route_mirror_type,
+        &ett_bmp_route_mirror_code,
     };
 
     module_t *bmp_module;
