@@ -3895,7 +3895,7 @@ dissect_lsp_ppr_pde(tvbuff_t *tvb, packet_info* pinfo _U_, proto_tree *sub_tree,
 
         id_type  = tvb_get_guint8(tvb, offset + 1);
         id_len   = mask_len = tvb_get_guint8(tvb, offset + 2);
-        if (id_type >= 4 && id_type <= 7)
+        if (id_type == 4 || id_type == 6)
             id_len /= 8;
 
         if (id_len + 5 + 1 > sub_len) {
